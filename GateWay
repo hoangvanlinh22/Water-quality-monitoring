@@ -1,0 +1,267 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include "ui.h"  // Đảm bảo bạn đã có file ui.h được tạo từ SquareLine hoặc LVGL Builder
+
+#define LVGL_TICK_PERIOD 20
+#define ESP32_RX 16
+#define ESP32_TX 17
+HardwareSerial MySerial(2);
+
+const char* ssid = "PDCN";
+const char* password = "1234567890";
+const char* adminUsername = "admin";
+const char* adminPassword = "123456";
+WebServer server(80);
+
+// LVGL + TFT config
+static const uint16_t screenWidth = 320;
+static const uint16_t screenHeight = 240;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[screenWidth * 10];
+TFT_eSPI tft = TFT_eSPI(screenWidth, screenHeight);
+
+String temp = "N/A";
+String TDS = "N/A";
+String TSS = "N/A";
+String pH = "N/A";
+bool loggedIn = false;
+
+// Hàm cập nhật chất lượng nước
+int calculateQualityLevel() {
+    float tempValue = temp.toFloat();
+    float TDSValue = TDS.toFloat();
+    float TSSValue = TSS.toFloat();
+    float pHValue = pH.toFloat();
+    int qualityLevel = 2;
+
+    if (tempValue >= 20 && tempValue <= 30 && TDSValue <= 500 && pHValue >= 6.5 && pHValue <= 8.5 && TSSValue <= 1)
+        qualityLevel = 0;
+    else if (tempValue >= 15 && tempValue <= 35 && TDSValue <= 500 && pHValue >= 6.5 && pHValue <= 8.5 && TSSValue <= 5)
+        qualityLevel = 1;
+    else if (tempValue >= 15 && tempValue <= 35 && TDSValue <= 1000 && pHValue >= 5.5 && pHValue <= 9 && TSSValue <= 5)
+        qualityLevel = 2;
+    else if (tempValue <= 10 || tempValue >= 35 || (TDSValue <= 1000 && pHValue >= 5.5 && pHValue <= 9 && TSSValue <= 5))
+        qualityLevel = 3;
+    else if (TDSValue > 1000 || pHValue < 5.5 || pHValue > 9 || TSSValue > 5)
+        qualityLevel = 4;
+
+    // Serial.print("Chất lượng nước (qualityLevel): ");
+    // Serial.println(qualityLevel);
+    delay(3000);
+    return qualityLevel;
+}
+
+String getQualityLevel() {
+    switch (calculateQualityLevel()) {
+        case 0: return "Very good for daily life";
+        case 1: return "Good for living activities";
+        case 2: return "Needs to be lightly processed for use in irrigation";
+        case 3: return "Only to be used for traffic";
+        case 4: return "Pollution, needs strong handling";
+        default: return "Needs to be lightly processed for use in irrigation";
+    }
+}
+
+// Hàm vẽ màn hình cho LVGL
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+    tft.endWrite();
+    lv_disp_flush_ready(disp);
+}
+
+// Cập nhật dữ liệu từ UART cho cả Web + UI
+void read_UART() {
+    if (MySerial.available()) {
+        String data = MySerial.readStringUntil('\n');
+        Serial.print("Received: ");
+        Serial.println(data);
+
+        String values[10];
+        int index = 0;
+
+        while (data.length() > 0) {
+            int commaIndex = data.indexOf(',');
+            if (commaIndex == -1) {
+                values[index++] = data;
+                break;
+            } else {
+                values[index++] = data.substring(0, commaIndex);
+                data = data.substring(commaIndex + 1);
+            }
+        }
+
+        if (index >= 4) {
+        temp = values[0];  // temp là biến toàn cục kiểu String
+        TDS  = values[1];
+        TSS  = values[2];
+        pH   = values[3];
+            // Cập nhật giao diện
+        String tempDisplay = values[0] + "\u00B0C";           
+        lv_label_set_text(ui_tempValue, tempDisplay.c_str());
+
+        String TDSDisplay = values[1] + " ppm";            
+        lv_label_set_text(ui_TDSValue, TDSDisplay.c_str());
+        
+        String TSSDisplay = values[2] + " NTU";            
+        lv_label_set_text(ui_TSSValue, TSSDisplay.c_str());
+
+        String pHDisplay = values[3];
+        lv_label_set_text(ui_pHValue, pHDisplay.c_str());   
+
+        String quality = getQualityLevel();
+        Serial.println("chất lượng nước: " + quality);
+        lv_label_set_text(ui_Label2, quality.c_str());
+
+        } else {
+            Serial.println("Lỗi: Dữ liệu UART không hợp lệ");
+        }
+    }
+}
+
+void serveFile(const char* path, const char* contentType) {
+    File file = SPIFFS.open(path, "r");
+    if (!file) {
+        Serial.println("Không tìm thấy file: " + String(path));
+        server.send(404, "text/plain", "File không tồn tại");
+        return;
+    }
+    server.streamFile(file, contentType);
+    file.close();
+}
+
+void handleRoot() {
+    if (!loggedIn) {
+        server.sendHeader("Location", "/login.html");
+        server.send(302);
+        return;
+    }
+    serveFile("/index.html", "text/html");
+}
+
+void setup() {
+    Serial.begin(9600);
+    MySerial.begin(9600, SERIAL_8N1, ESP32_RX, ESP32_TX);
+
+    lv_init();
+    tft.begin();
+    tft.setRotation(1);
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = screenWidth;
+    disp_drv.ver_res = screenHeight;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
+    ui_init();
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("Lỗi khi khởi tạo SPIFFS");
+        return;
+    }
+
+    WiFi.begin(ssid, password);
+    Serial.print("Đang kết nối WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    Serial.print("Đã kết nối! IP: ");
+    Serial.println(WiFi.localIP());
+
+    server.on("/", handleRoot);
+    server.on("/index.html", handleRoot);
+    server.on("/login.html", HTTP_GET, []() {
+        serveFile("/login.html", "text/html");
+    });
+    server.on("/style.css", HTTP_GET, []() {
+        serveFile("/style.css", "text/css");
+    });
+    server.on("/script.js", HTTP_GET, []() {
+        serveFile("/script.js", "application/javascript");
+    });
+    server.on("/logo.png", HTTP_GET, []() {
+        serveFile("/logo.png", "image/png");
+    });
+    server.on("/2.png", HTTP_GET, []() {
+        serveFile("/2.png", "image/png");
+    });
+    server.on("/fb.png", HTTP_GET, []() {
+        serveFile("/fb.png", "image/png");
+    });
+    server.on("/gmail.png", HTTP_GET, []() {
+        serveFile("/gmail.png", "image/png");
+    });
+
+    server.on("/login", HTTP_POST, []() {
+        if (server.hasArg("username") && server.hasArg("password")) {
+            String username = server.arg("username");
+            String password = server.arg("password");
+            if (username == adminUsername && password == adminPassword) {
+                loggedIn = true;
+                server.send(200, "application/json", "{\"success\":true}");
+            } else {
+                server.send(401, "application/json", "{\"success\":false,\"error\":\"Sai tài khoản hoặc mật khẩu\"}");
+            }
+        } else {
+            server.send(400, "application/json", "{\"success\":false,\"error\":\"Thiếu thông tin đăng nhập\"}");
+        }
+    });
+
+    server.on("/logout", HTTP_POST, []() {
+        loggedIn = false;
+        server.send(200, "text/plain", "Đã đăng xuất");
+    });
+
+    server.on("/api/data", HTTP_GET, []() {
+        if (!loggedIn) {
+            server.send(401, "application/json", "{\"error\":\"Chưa đăng nhập\"}");
+            return;
+        }
+
+        String quality = getQualityLevel();
+        String json = "{";
+        json += "\"temp\":\"" + temp + "\",";
+        json += "\"TDS\":\"" + TDS + "\",";
+        json += "\"TSS\":\"" + TSS + "\",";
+        json += "\"pH\":\"" + pH + "\",";
+        json += "\"quality\":\"" + quality + "\"";
+        json += "}";
+        server.send(200, "application/json", json);
+    });
+    server.on("/control", HTTP_POST, []() {
+        if (server.hasArg("relay") && server.hasArg("state")) {
+            int relay = server.arg("relay").toInt();
+            int state = server.arg("state").toInt();
+            // Điều khiển relay thực tế ở đây
+            server.send(200, "text/plain", "OK");
+        } else {
+            server.send(400, "text/plain", "Bad Request");
+        }
+    });
+
+    server.begin();
+    Serial.println("Web server đã khởi động!");
+}
+
+void loop() {
+    read_UART();
+    
+    server.handleClient();
+    lv_timer_handler();
+    delay(10);
+    // String quality = getQualityLevel();
+    // Serial.println("chất lượng nước: " + quality);
+    // lv_label_set_text(ui_Label2, quality.c_str());
+}
